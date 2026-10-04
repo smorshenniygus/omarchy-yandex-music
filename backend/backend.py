@@ -29,6 +29,8 @@ from dbus_next.aio import MessageBus
 from dbus_next.constants import PropertyAccess
 from dbus_next.service import ServiceInterface, dbus_property, method, signal as dbus_signal
 from yandex_music import Client
+from yandex_music.exceptions import NetworkError, TimedOutError
+from yandex_music.utils.request import Request
 from yandex_music._client.device_auth import _DEFAULT_CLIENT_ID, _DEFAULT_CLIENT_SECRET, _OAUTH_BASE_URL
 
 if __package__:
@@ -107,6 +109,10 @@ HTTP_JSON_MAX_BYTES = 1024 * 1024
 NOTIFICATION_COVER_MAX_BYTES = 5_000_000
 NETWORK_CHUNK_BYTES = 64 * 1024
 IPC_READ_TIMEOUT = 1.0
+# Analytics wait this long after a finished track so the next start is not
+# queued behind them on the shared API lock, but never longer than the cap.
+TELEMETRY_SWITCH_HOLD = 1.0
+TELEMETRY_MAX_DEFER = 20.0
 IPC_WRITE_TIMEOUT = 3.0
 
 
@@ -395,6 +401,31 @@ def playback_control(function: Callable) -> Callable:
     return controlled
 
 
+class SessionRequest(Request):
+    """Library request layer over a shared keep-alive session.
+
+    The stock layer opens a new TLS connection for every call, which adds
+    roughly half a second to each API request made while switching tracks.
+    """
+
+    def __init__(self, session: requests.Session) -> None:
+        super().__init__()
+        self.session = session
+
+    def _request_wrapper(self, *args: Any, **kwargs: Any) -> bytes:
+        kwargs = self._prepare_kwargs(kwargs)
+        try:
+            resp = self.session.request(*args, **kwargs)
+        except requests.Timeout as exc:
+            raise TimedOutError from exc
+        except requests.RequestException as exc:
+            raise NetworkError(exc) from exc
+        if 200 <= resp.status_code <= 299:
+            return resp.content
+        self._handle_error_response(resp.status_code, resp.content)
+        return None
+
+
 class Player:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -466,6 +497,9 @@ class Player:
         self.radio_advance_pending = False
         self.playback_report: dict[str, Any] | None = None
         self.telemetry_queue: queue_module.Queue[Any] = queue_module.Queue(maxsize=TELEMETRY_QUEUE_SIZE)
+        self.telemetry_hold_until = 0.0
+        self.playback_loads = 0
+        self.http = requests.Session()
         self.mpv: subprocess.Popen | None = None
         self.had_file = False
         self.active_ticks = 0
@@ -566,6 +600,14 @@ class Player:
     def _telemetry_worker(self) -> None:
         while True:
             operation = self.telemetry_queue.get()
+            # A track start must not queue behind analytics on the shared API lock.
+            deadline = time.monotonic() + TELEMETRY_MAX_DEFER
+            while time.monotonic() < deadline:
+                with self.lock:
+                    busy = (getattr(self, "playback_loads", 0) > 0
+                            or time.monotonic() < getattr(self, "telemetry_hold_until", 0.0))
+                if not busy: break
+                time.sleep(.1)
             try:
                 # Analytics must remain serialized with foreground API calls, but
                 # must not amplify a rate limit or expose a background error in UI.
@@ -646,6 +688,8 @@ class Player:
             play_id = str(report["playId"])
             station = str(report["station"])
             batch_id = str(report["batchId"])
+            # The next track usually starts right after this report is queued.
+            self.telemetry_hold_until = self._float(report["lastTick"]) + TELEMETRY_SWITCH_HOLD
         operations: list[Callable[[], Any]] = []
         if album_id:
             operations.append(lambda client=client, track_id=track_id, album_id=album_id,
@@ -881,7 +925,7 @@ class Player:
 
     def _connect(self, token: str) -> None:
         with self.lock: self.state.update(connecting=True, error="")
-        client = Client(token).init()
+        client = Client(token, request=SessionRequest(self.http)).init()
         with self.lock:
             self.client = client
             self.session_generation += 1
@@ -896,7 +940,7 @@ class Player:
             self.state.update(authPending=True, authUrl="", authCode="", error="")
         def worker() -> None:
             try:
-                client = Client()
+                client = Client(request=SessionRequest(self.http))
                 def got_code(code: Any) -> None:
                     with self.lock: self.state.update(authUrl=code.verification_url, authCode=code.user_code)
                 token = client.device_auth(on_code=got_code)
@@ -1369,7 +1413,7 @@ class Player:
                 # The current settings2 endpoint requires JSON, while the
                 # unofficial client's helper still submits form data.
                 def update_settings() -> dict[str, Any]:
-                    response = requests.post(
+                    response = self.http.post(
                         f"{self.client.base_url}/rotor/station/{station}/settings2",
                         headers=dict(self.client._request.headers),
                         proxies=self.client._request.proxies,
@@ -3660,8 +3704,9 @@ class Player:
             finally:
                 self.api_lock.release()
         else:
+            # get_direct_links=True resolves every variant serially; fetch only the chosen one.
             infos = self._api_call(
-                lambda: track.get_download_info(get_direct_links=True),
+                lambda: track.get_download_info(get_direct_links=False),
                 update_loading=update_loading) or []
         if not infos: raise RuntimeError("Яндекс не вернул ссылку на аудио")
         if quality == "economy":
@@ -3805,6 +3850,8 @@ class Player:
         self.mpv = subprocess.Popen(["/usr/bin/mpv", "--idle=yes", "--no-video", "--audio-display=no",
             "--no-terminal", "--load-scripts=no", "--gapless-audio=yes", "--prefetch-playlist=yes",
             "--audio-client-name=Yandex Music",
+            # Reuse one HTTP connection for the range requests mpv makes while opening a stream.
+            "--stream-lavf-o=multiple_requests=1",
             f"--input-ipc-server={MPV_SOCKET}", "--force-window=no", f"--volume={self.volume}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(60):
@@ -4027,7 +4074,12 @@ class Player:
                 self.active_cache_path = None
                 if self.state.get("loadingKind", "") in ("", "track"):
                     self.state.update(loading=True, loadingKind="track", error="")
+                self.playback_loads = getattr(self, "playback_loads", 0) + 1
         def load() -> None:
+            try: load_track()
+            finally:
+                with self.lock: self.playback_loads -= 1
+        def load_track() -> None:
             last_error: Exception | None = None
             cache = getattr(self, "audio_cache", None)
             identity = self._cache_identity(track) if cache else None
