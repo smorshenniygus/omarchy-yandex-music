@@ -13,6 +13,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 from backend import backend
+from backend.audio_cache import AudioCache, AudioIdentity, AudioSource, CacheRequest, cache_directory
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +37,54 @@ class FakeResponse:
 
 
 class SecurityBoundaryTests(unittest.TestCase):
+    def test_audio_cache_uses_xdg_only_when_absolute(self):
+        with patch.dict(os.environ, {"XDG_CACHE_HOME": "/tmp/custom-cache"}):
+            self.assertEqual(cache_directory(), Path("/tmp/custom-cache/omarchy-yandex-music/audio"))
+        with patch.dict(os.environ, {"XDG_CACHE_HOME": "relative"}):
+            self.assertEqual(cache_directory(), Path.home() / ".cache/omarchy-yandex-music/audio")
+
+    def test_audio_download_streams_with_timeouts_and_size_limits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = AudioCache(Path(temporary), max_file=5)
+            identity = AudioIdentity.for_track("account", "../../escape", "best")
+            request = CacheRequest(identity, lambda: AudioSource("https://audio.test/track", "mp3", 320),
+                                   lambda: True, lambda path: None)
+            response = FakeResponse([b"1234", b"56"], {"content-length": "6"})
+            try:
+                with patch("backend.audio_cache.requests.get", return_value=response) as get:
+                    self.assertIsNone(cache._download(request, threading.Event()))
+                get.assert_called_once_with("https://audio.test/track", timeout=(3, 5), stream=True,
+                                            headers={"Accept-Encoding": "identity"})
+                self.assertTrue(response.closed)
+                self.assertFalse(list(Path(temporary).iterdir()))
+            finally:
+                cache.close()
+                cache.worker.join(2)
+
+    def test_audio_cache_rejects_symlink_directory_and_local_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir()
+            link = root / "link"
+            link.symlink_to(target, target_is_directory=True)
+            cache = AudioCache(link)
+            try: self.assertFalse(cache.enabled)
+            finally:
+                cache.close()
+                cache.worker.join(2)
+            cache = AudioCache(target)
+            identity = AudioIdentity.for_track("account", "track", "best")
+            request = CacheRequest(identity, lambda: AudioSource("file:///etc/passwd", "mp3", 320),
+                                   lambda: True, lambda path: None)
+            try:
+                with patch("backend.audio_cache.requests.get") as get:
+                    self.assertIsNone(cache._download(request, threading.Event()))
+                    get.assert_not_called()
+            finally:
+                cache.close()
+                cache.worker.join(2)
+
     def test_recv_line_accepts_message_at_limit(self):
         sender, receiver = socket.socketpair()
         with sender, receiver:
@@ -190,13 +239,14 @@ class SecurityBoundaryTests(unittest.TestCase):
                 printf 'python %s\\n' "$*" >>"$INSTALLER_TEST_LOG"
             """))
             python.chmod(0o755)
-            for command in ("mpv", "systemctl"):
+            for command in ("mpv", "systemctl", "omarchy"):
                 executable = fake_bin / command
                 executable.write_text("#!/usr/bin/env bash\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >>\"$INSTALLER_TEST_LOG\"\n")
                 executable.chmod(0o755)
             environment = {
                 **os.environ,
                 "HOME": str(home),
+                "XDG_CACHE_HOME": str(home / "custom cache %"),
                 "XDG_RUNTIME_DIR": str(runtime),
                 "PATH": f"{fake_bin}:{os.environ['PATH']}",
                 "INSTALLER_TEST_LOG": str(log),
@@ -206,6 +256,12 @@ class SecurityBoundaryTests(unittest.TestCase):
             first_log = log.read_text()
             self.assertIn("--require-hashes", first_log)
             self.assertEqual(first_log.count("python -m pip install"), 1)
+            unit = (home / ".config/systemd/user/omarchy-yandex-music.service").read_text()
+            self.assertIn(f'Environment="XDG_CACHE_HOME={home}/custom cache %%"', unit)
+            self.assertIn(f'"{home}/custom cache %%/omarchy-yandex-music/audio"', unit)
+            self.assertIn("ProtectHome=read-only", unit)
+            self.assertTrue((home / "custom cache %/omarchy-yandex-music/audio").is_dir())
+            self.assertTrue((home / ".local/share/omarchy-yandex-music/audio_cache.py").is_file())
 
             subprocess.run(command, check=True, env=environment, capture_output=True, text=True)
             self.assertEqual(log.read_text().count("python -m pip install"), 1)
@@ -214,6 +270,11 @@ class SecurityBoundaryTests(unittest.TestCase):
             dependency_marker.write_text("stale\n")
             subprocess.run(command, check=True, env=environment, capture_output=True, text=True)
             self.assertEqual(log.read_text().count("python -m pip install"), 2)
+            changed_environment = {**environment, "XDG_CACHE_HOME": str(home / "new cache")}
+            subprocess.run([str(ROOT / "uninstall.sh")], check=True, env=changed_environment,
+                           capture_output=True, text=True)
+            self.assertFalse((home / "custom cache %/omarchy-yandex-music/audio").exists())
+            self.assertTrue((home / ".config/omarchy-yandex-music").exists())
 
     def test_vendored_yandex_music_wheel_matches_lock(self):
         wheel = ROOT / "vendor/yandex_music-3.1.0b2-py3-none-any.whl"

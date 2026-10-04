@@ -8,6 +8,11 @@ APP_DIR="$HOME/.local/share/omarchy-yandex-music"
 UNIT_DIR="$HOME/.config/systemd/user"
 MARKER="$APP_DIR/.installed-version"
 DEPENDENCY_MARKER="$APP_DIR/.installed-dependencies"
+BACKEND_MARKER="$APP_DIR/.installed-backend"
+CACHE_MARKER="$APP_DIR/.installed-cache-home"
+CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+[[ "$CACHE_HOME" = /* ]] || CACHE_HOME="$HOME/.cache"
+AUDIO_CACHE_DIR="$CACHE_HOME/omarchy-yandex-music/audio"
 BACKEND_ONLY=0
 
 case "${1:-}" in
@@ -30,14 +35,17 @@ done
 VERSION="$(jq -er '.version' "$ROOT/manifest.json")"
 DEPENDENCY_DIGEST="$(sha256sum "$ROOT/requirements.txt" \
   "$ROOT/vendor/yandex_music-3.1.0b2-py3-none-any.whl" | cut -d' ' -f1 | sha256sum | cut -d' ' -f1)"
+BACKEND_DIGEST="$( { sha256sum "$ROOT/backend/backend.py" "$ROOT/backend/audio_cache.py" \
+  "$ROOT/systemd/omarchy-yandex-music.service" | cut -d' ' -f1; printf '%s\n' "$CACHE_HOME"; } | sha256sum | cut -d' ' -f1)"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 mkdir -p "$RUNTIME_DIR"
 exec 9>"$RUNTIME_DIR/omarchy-yandex-music-install.lock"
 flock 9
 
 mkdir -p "$PLUGIN_DIR" "$APP_DIR" "$HOME/.local/bin" "$UNIT_DIR" \
-  "$HOME/.config/omarchy-yandex-music"
+  "$HOME/.config/omarchy-yandex-music" "$AUDIO_CACHE_DIR"
 chmod 700 "$HOME/.config/omarchy-yandex-music"
+chmod 700 "$AUDIO_CACHE_DIR"
 
 # `omarchy plugin add` clones the whole repository directly into PLUGIN_DIR.
 # Keep legacy `git clone && ./install.sh` installations compatible by copying
@@ -54,6 +62,7 @@ if [[ "$(realpath "$ROOT")" != "$(realpath "$PLUGIN_DIR")" ]]; then
     "$ROOT/vendor/yandex_music-3.1.0b2-py3-none-any.whl" "$PLUGIN_DIR/vendor/"
   install -m 755 "$ROOT/install.sh" "$ROOT/bootstrap.sh" "$ROOT/uninstall.sh" "$PLUGIN_DIR/"
   install -m 755 "$ROOT/backend/backend.py" "$PLUGIN_DIR/backend/backend.py"
+  install -m 644 "$ROOT/backend/audio_cache.py" "$PLUGIN_DIR/backend/audio_cache.py"
   install -m 755 "$ROOT/bin/omarchy-yandex-music" "$PLUGIN_DIR/bin/omarchy-yandex-music"
   install -m 644 "$ROOT/systemd/omarchy-yandex-music.service" \
     "$PLUGIN_DIR/systemd/omarchy-yandex-music.service"
@@ -64,7 +73,9 @@ fi
 if ((BACKEND_ONLY)) &&
   [[ -r "$MARKER" && "$(<"$MARKER")" == "$VERSION" ]] &&
   [[ -r "$DEPENDENCY_MARKER" && "$(<"$DEPENDENCY_MARKER")" == "$DEPENDENCY_DIGEST" ]] &&
-  [[ -x "$APP_DIR/venv/bin/python" && -f "$APP_DIR/backend.py" ]] &&
+  [[ -r "$BACKEND_MARKER" && "$(<"$BACKEND_MARKER")" == "$BACKEND_DIGEST" ]] &&
+  [[ -r "$CACHE_MARKER" && "$(<"$CACHE_MARKER")" == "$CACHE_HOME" ]] &&
+  [[ -x "$APP_DIR/venv/bin/python" && -f "$APP_DIR/backend.py" && -f "$APP_DIR/audio_cache.py" ]] &&
   [[ -x "$HOME/.local/bin/omarchy-yandex-music" && -f "$UNIT_DIR/omarchy-yandex-music.service" ]]; then
   systemctl --user daemon-reload
   systemctl --user enable --now omarchy-yandex-music.service >/dev/null
@@ -73,9 +84,21 @@ if ((BACKEND_ONLY)) &&
 fi
 
 install -m 755 "$ROOT/backend/backend.py" "$APP_DIR/backend.py"
+install -m 644 "$ROOT/backend/audio_cache.py" "$APP_DIR/audio_cache.py"
 install -m 755 "$ROOT/bin/omarchy-yandex-music" "$HOME/.local/bin/omarchy-yandex-music"
-install -m 644 "$ROOT/systemd/omarchy-yandex-music.service" \
-  "$UNIT_DIR/omarchy-yandex-music.service"
+# systemd does not expand shell variables in ReadWritePaths. Capture the same
+# absolute XDG cache path in both its environment and the narrow write allowance.
+SYSTEMD_CACHE_HOME="${CACHE_HOME//\\/\\\\}"
+SYSTEMD_CACHE_HOME="${SYSTEMD_CACHE_HOME//\"/\\\"}"
+SYSTEMD_CACHE_HOME="${SYSTEMD_CACHE_HOME//%/%%}"
+while IFS= read -r line; do
+  case "$line" in
+    Environment=XDG_CACHE_HOME=*) printf 'Environment="XDG_CACHE_HOME=%s"\n' "$SYSTEMD_CACHE_HOME" ;;
+    ReadWritePaths=*) printf 'ReadWritePaths=%%h/.config/omarchy-yandex-music %%t "%s/omarchy-yandex-music/audio"\n' "$SYSTEMD_CACHE_HOME" ;;
+    *) printf '%s\n' "$line" ;;
+  esac
+done <"$ROOT/systemd/omarchy-yandex-music.service" >"$UNIT_DIR/omarchy-yandex-music.service"
+chmod 644 "$UNIT_DIR/omarchy-yandex-music.service"
 
 if [[ ! -x "$APP_DIR/venv/bin/python" ]] ||
   [[ ! -r "$DEPENDENCY_MARKER" || "$(<"$DEPENDENCY_MARKER")" != "$DEPENDENCY_DIGEST" ]]; then
@@ -101,6 +124,10 @@ systemctl --user enable omarchy-yandex-music.service >/dev/null
 systemctl --user restart omarchy-yandex-music.service
 printf '%s\n' "$VERSION" >"$MARKER"
 chmod 644 "$MARKER"
+printf '%s\n' "$BACKEND_DIGEST" >"$BACKEND_MARKER"
+chmod 644 "$BACKEND_MARKER"
+printf '%s\n' "$CACHE_HOME" >"$CACHE_MARKER"
+chmod 600 "$CACHE_MARKER"
 
 if ((BACKEND_ONLY)); then
   echo "Yandex Music backend $VERSION installed."

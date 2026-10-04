@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
@@ -28,6 +29,11 @@ from dbus_next.constants import PropertyAccess
 from dbus_next.service import ServiceInterface, dbus_property, method, signal as dbus_signal
 from yandex_music import Client
 from yandex_music._client.device_auth import _DEFAULT_CLIENT_ID, _DEFAULT_CLIENT_SECRET, _OAUTH_BASE_URL
+
+if __package__:
+    from .audio_cache import AudioCache, AudioIdentity, AudioSource, BackgroundBusy, CacheRequest, cache_directory
+else:
+    from audio_cache import AudioCache, AudioIdentity, AudioSource, BackgroundBusy, CacheRequest, cache_directory
 
 APP_VERSION = "0.8.2"
 CONFIG = Path.home() / ".config/omarchy-yandex-music"
@@ -360,6 +366,15 @@ class MprisBridge:
             self.loop.call_soon_threadsafe(self.interface.publish, seeked)
 
 
+def playback_control(function: Callable) -> Callable:
+    @wraps(function)
+    def controlled(self: Any, *args: Any, **kwargs: Any) -> Any:
+        with getattr(self, "control_lock", self.lock):
+            if getattr(self, "prepared_entry", None): self._sync_prepared()
+            return function(self, *args, **kwargs)
+    return controlled
+
+
 class Player:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -435,6 +450,17 @@ class Player:
         self.last_playback_progress_at = time.monotonic()
         self.last_playback_position = 0.0
         self.play_generation = 0
+        self.control_lock = threading.RLock()
+        self.session_generation = 0
+        self.audio_cache = AudioCache(cache_directory())
+        self.preload_candidate: dict[str, Any] | None = None
+        self.prepared_entry: dict[str, Any] | None = None
+        self.active_entry_id: int | None = None
+        self.active_cache_path: Path | None = None
+        self.completed_generation = -1
+        self.mpv_events_connected = threading.Event()
+        self.mpv_event_stop = threading.Event()
+        self.mpv_events_thread: threading.Thread | None = None
         self.consecutive_failures = 0
         self.last_saved_at = 0.0
         self.volume = 70
@@ -707,6 +733,7 @@ class Player:
             if preferences.get(key) not in values: preferences[key] = DEFAULT_PREFERENCES[key]
         return preferences
 
+    @playback_control
     def set_preference(self, key: str, value: Any) -> None:
         if key not in DEFAULT_PREFERENCES: raise ValueError(f"Неизвестная настройка: {key}")
         bool_keys = ("autoResume", "restoreQueue", "restorePosition", "restoreVolume",
@@ -731,6 +758,9 @@ class Player:
             self.state["preferences"] = dict(self.preferences)
             self.state["error"] = ""
         atomic_json(PREFERENCES_FILE, self.preferences)
+        if key in ("playbackMode", "audioQuality"):
+            self._reset_preload()
+            self._schedule_preload()
         if key == "playbackMode": self._publish_mpris()
 
     def _load_token(self) -> dict[str, Any]:
@@ -786,6 +816,7 @@ class Player:
         client = Client(token).init()
         with self.lock:
             self.client = client
+            self.session_generation += 1
             self.state.update(authenticated=True, connecting=False, authPending=False, authCode="")
         self._load_playlists()
         self._load_liked_ids()
@@ -809,8 +840,10 @@ class Player:
         threading.Thread(target=worker, daemon=True).start()
 
     def logout(self) -> None:
+        account = self._cache_account()
         self.stop()
         with self.lock:
+            self.session_generation = getattr(self, "session_generation", 0) + 1
             self.client = None; self.playlists = []; self.artist_results = []; self.library_results = []
             self.library_result_refs = []
             self.search_results = []
@@ -849,6 +882,7 @@ class Player:
                               position=0.0, positionObservedAt=time.time(),
                               liked=False, disliked=False, error="")
         self._publish_mpris()
+        if getattr(self, "audio_cache", None): self.audio_cache.clear_account(account)
         TOKEN_FILE.unlink(missing_ok=True); STATE_FILE.unlink(missing_ok=True)
 
     @classmethod
@@ -1219,6 +1253,7 @@ class Player:
                     self.state.update(liked=not was_liked,
                                       disliked=track_id in self.disliked_ids)
                 self.state["error"] = ""
+            self._schedule_preload()
             self._save_state(True)
         except Exception as exc:
             self._set_error(f"Не удалось изменить отметку «Мне нравится»: {exc}")
@@ -1362,14 +1397,16 @@ class Player:
                 if failed_to_advance:
                     raise RuntimeError("Яндекс не вернул новые треки для радио")
                 if should_advance:
-                    self._play_current()
+                    self._continue_extended(generation)
                 else:
                     with self.lock:
                         if self.state.get("loadingKind") in ("wave", "radio"):
                             self.state.update(loading=False, loadingKind="", loadingStage="")
                 self._save_state(True)
+                self._schedule_preload()
             except Exception as exc:
                 with self.lock:
+                    if generation != self.queue_generation: return
                     self.radio_extending = False; self.radio_advance_pending = False
                 self._set_error(f"Не удалось продолжить радио: {exc}")
         threading.Thread(target=load, daemon=True).start()
@@ -1402,9 +1439,11 @@ class Player:
                     self.queue_extending = False
                 self._save_state(True)
                 if should_advance:
-                    self._play_current()
+                    self._continue_extended(generation)
                 elif retry_advance:
                     self._extend_collection(advance=True)
+                else:
+                    self._schedule_preload()
             except Exception as exc:
                 with self.lock:
                     if generation != self.queue_generation: return
@@ -1471,11 +1510,13 @@ class Player:
                     self.queue_extending = False
                 self._save_state(True)
                 if should_advance:
-                    self._play_current()
+                    self._continue_extended(generation)
                 elif retry_advance:
                     self._extend_artist_queue(True, advance_automatic)
                 elif finish_advance:
                     self.next(automatic=advance_automatic)
+                else:
+                    self._schedule_preload()
             except Exception as exc:
                 with self.lock:
                     if generation != self.queue_generation: return
@@ -1496,6 +1537,12 @@ class Player:
             self._extend_collection()
         elif should_extend_artist:
             self._extend_artist_queue()
+
+    def _continue_extended(self, generation: int) -> None:
+        with getattr(self, "control_lock", self.lock):
+            with self.lock:
+                if generation != self.queue_generation: return
+            self._play_current()
 
     def play_playlist(self, kind: str) -> None:
         cache_key = f"playlist:{kind}"
@@ -3439,6 +3486,7 @@ class Player:
         threading.Thread(target=load, daemon=True).start()
         return self._track_info_response(track_id, loading=True)
 
+    @playback_control
     def play_queue(self, index: int) -> None:
         with self.lock:
             if not (0 <= index < len(self.queue)): return
@@ -3476,6 +3524,7 @@ class Player:
     def close_artist(self) -> None:
         self.catalog_back()
 
+    @playback_control
     def _set_queue(self, tracks: list[Any], name: str, station: str = "", batch_id: str = "",
                    start_index: int = 0, remaining_rows: list[Any] | None = None,
                    collection_key: str = "", prepared_url: str = "",
@@ -3521,48 +3570,359 @@ class Player:
                 "artUrl": self._cover_url(track),
                 "duration": self._int(getattr(track, "duration_ms", 0)) // 1000}
 
-    def _url(self, track: Any, *, variant: int = 0, update_loading: bool = True) -> str:
-        infos = self._api_call(
-            lambda: track.get_download_info(get_direct_links=True),
-            update_loading=update_loading) or []
+    def _audio_source(self, track: Any, *, variant: int = 0, update_loading: bool = True,
+                      quality: str | None = None, background: bool = False) -> AudioSource:
+        quality = quality or self.preferences["audioQuality"]
+        if background:
+            # Do not wait behind foreground calls or retry 429 while holding api_lock.
+            if not self.api_lock.acquire(blocking=False):
+                raise BackgroundBusy("foreground API request in progress")
+            try:
+                infos = track.get_download_info(get_direct_links=False) or []
+            finally:
+                self.api_lock.release()
+        else:
+            infos = self._api_call(
+                lambda: track.get_download_info(get_direct_links=True),
+                update_loading=update_loading) or []
         if not infos: raise RuntimeError("Яндекс не вернул ссылку на аудио")
-        if self.preferences["audioQuality"] == "economy":
+        if quality == "economy":
             infos.sort(key=lambda x: (x.bitrate_in_kbps or 10_000, x.codec not in ("aac", "mp3")))
         else:
             infos.sort(key=lambda x: (x.codec in ("mp3", "aac"), x.bitrate_in_kbps or 0), reverse=True)
         info = infos[variant % len(infos)]
-        return info.direct_link or self._api_call(
-            info.get_direct_link, update_loading=update_loading)
+        url = info.direct_link
+        if not url:
+            if background:
+                if not self.api_lock.acquire(blocking=False):
+                    raise BackgroundBusy("foreground API request in progress")
+                try: url = info.get_direct_link()
+                finally: self.api_lock.release()
+            else:
+                url = self._api_call(info.get_direct_link, update_loading=update_loading)
+        return AudioSource(url, str(info.codec), int(info.bitrate_in_kbps or 0))
+
+    def _url(self, track: Any, *, variant: int = 0, update_loading: bool = True) -> str:
+        return self._audio_source(track, variant=variant, update_loading=update_loading).url
+
+    def _cache_account(self) -> str:
+        client = self.client
+        return str(getattr(client, "account_uid", "") or getattr(client, "token", "") or id(client))
+
+    def _cache_identity(self, track: Any) -> AudioIdentity:
+        return AudioIdentity.for_track(self._cache_account(), self._track_id(track),
+                                       self.preferences.get("audioQuality", "best"))
+
+    def _preload_signature_locked(self) -> tuple:
+        return (getattr(self, "session_generation", 0), self.queue_generation,
+                self.queue_revision, self.play_generation, self.index,
+                self.preferences.get("playbackMode", "repeatQueue"),
+                self.preferences.get("audioQuality", "best"),
+                self._track_id(self.detached_track) if self.detached_track else "")
+
+    def _next_target_locked(self, automatic: bool) -> int | str:
+        """One selection policy shared by preloading and actual transitions."""
+        mode = str(self.preferences.get("playbackMode", "repeatQueue"))
+        if automatic and mode == "repeatTrack" and self.detached_track is None:
+            return self.index
+        if self.index >= len(self.queue) - 1:
+            if self.radio_station: return "radio"
+            if self.queue_source: return "collection"
+            if self.queue_artist_id and self.queue_artist_has_more: return "artist"
+        if mode == "shuffle" and len(self.queue) > 1:
+            candidate = getattr(self, "preload_candidate", None)
+            if candidate and candidate["signature"] == self._preload_signature_locked():
+                return candidate["index"]
+            return random.choice([i for i in range(len(self.queue)) if i != self.index])
+        if self.index < len(self.queue) - 1: return self.index + 1
+        return 0 if mode == "repeatQueue" else "end"
+
+    def _reset_preload(self) -> None:
+        if not getattr(self, "audio_cache", None): return
+        with self.lock:
+            self.preload_candidate = None
+            self.prepared_entry = None
+        self.audio_cache.cancel()
+        try: self._mpv_command(["playlist-clear"], False)
+        except Exception: pass
+
+    def _schedule_preload(self) -> None:
+        if not getattr(self, "audio_cache", None): return
+        with self.control_lock:
+            ready_path = None
+            with self.lock:
+                if (not self.client or self.state.get("stopped") or not self.had_file
+                        or not self.queue): return
+                signature = self._preload_signature_locked()
+                candidate = self.preload_candidate
+                if candidate and candidate["signature"] == signature:
+                    if (not self.prepared_entry and candidate.get("ready_path")
+                            and self.mpv_events_connected.is_set()):
+                        ready_path = candidate["ready_path"]
+                        target = candidate["index"]
+                        track = self.queue[target]
+                    else: return
+            if ready_path:
+                self._prepare_playlist(ready_path, signature, target, track)
+                return
+            self._reset_preload()
+            with self.lock:
+                target = self._next_target_locked(True)
+                current = self._current_track_locked()
+                quality = self.preferences.get("audioQuality", "best")
+                candidate = {"signature": signature, "index": target}
+                self.preload_candidate = candidate
+                track = self.queue[target] if isinstance(target, int) else None
+                current_identity = self._cache_identity(current) if current else None
+                identity = self._cache_identity(track) if track else None
+                active_path = self.active_cache_path
+            def valid() -> bool:
+                with self.lock:
+                    return (signature == self._preload_signature_locked()
+                            and not self.state.get("stopped"))
+            requests_ = []
+            if track and identity:
+                requests_.append(CacheRequest(identity,
+                    lambda: self._audio_source(track, quality=quality, background=True), valid,
+                    lambda path: self._prepare_playlist(path, signature, target, track)))
+            if current and current_identity and current_identity != identity:
+                requests_.append(CacheRequest(current_identity,
+                    lambda: self._audio_source(current, quality=quality, background=True), valid,
+                    lambda path: None))
+            self.audio_cache.protect({item for item in (identity, current_identity) if item},
+                                     {active_path} if active_path else set())
+            self.audio_cache.schedule(requests_)
+
+    def _prepare_playlist(self, path: Path, signature: tuple, index: int, track: Any) -> None:
+        with self.control_lock:
+            with self.lock:
+                if signature != self._preload_signature_locked() or self.state.get("stopped"): return
+                if self.preload_candidate: self.preload_candidate["ready_path"] = path
+                if not self.had_file or not self.mpv_events_connected.is_set(): return
+            # Never append to an idle core: it could start an obsolete candidate later.
+            if self._mpv_command(["get_property", "idle-active"], False): return
+            self._mpv_command(["playlist-clear"], False)
+            self._mpv_command(["loadfile", str(path), "append"], False)
+            playlist = self._mpv_command(["get_property", "playlist"], False) or []
+            if not playlist: return
+            with self.lock:
+                self.prepared_entry = {"signature": signature, "index": index, "track": track,
+                                       "path": path, "id": playlist[-1]["id"]}
+
+    def _sync_prepared(self) -> None:
+        """Catch up with the core before a manual action races its queued events."""
+        prepared = self.prepared_entry
+        if not prepared: return
+        try:
+            playlist = self._mpv_command(["get_property", "playlist"], False) or []
+            if any(row.get("playing") and row.get("id") == prepared["id"] for row in playlist):
+                self._mpv_file_loaded(prepared["id"])
+        except Exception: pass
 
     def _ensure_mpv(self) -> None:
-        if self.mpv and self.mpv.poll() is None and MPV_SOCKET.exists(): return
+        if self.mpv and self.mpv.poll() is None and MPV_SOCKET.exists():
+            self._ensure_mpv_events()
+            return
         MPV_SOCKET.unlink(missing_ok=True)
         self.mpv = subprocess.Popen(["/usr/bin/mpv", "--idle=yes", "--no-video", "--audio-display=no",
-            "--no-terminal", "--load-scripts=no", "--audio-client-name=Yandex Music",
+            "--no-terminal", "--load-scripts=no", "--gapless-audio=yes", "--prefetch-playlist=yes",
+            "--audio-client-name=Yandex Music",
             f"--input-ipc-server={MPV_SOCKET}", "--force-window=no", f"--volume={self.volume}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(60):
-            if MPV_SOCKET.exists(): return
+            if MPV_SOCKET.exists():
+                self._ensure_mpv_events()
+                return
             time.sleep(.05)
         raise RuntimeError("Не удалось запустить mpv")
 
     def _mpv_command(self, command: list[Any], start: bool = True) -> Any:
-        if start: self._ensure_mpv()
+        if start:
+            with self.control_lock: self._ensure_mpv()
         elif not self.mpv or self.mpv.poll() is not None or not MPV_SOCKET.exists(): return None
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(3); sock.connect(str(MPV_SOCKET))
-            sock.sendall((json.dumps({"command": command}) + "\n").encode())
-            data = recv_line(sock, MPV_RESPONSE_MAX_BYTES, "mpv IPC")
-        try:
-            response = json.loads(data)
-        except (IndexError, json.JSONDecodeError) as exc:
-            raise RuntimeError("mpv вернул некорректный ответ") from exc
+            sock.sendall((json.dumps({"command": command, "request_id": 1}) + "\n").encode())
+            with sock.makefile("rb") as stream:
+                while True:
+                    data = stream.readline(MPV_RESPONSE_MAX_BYTES + 1)
+                    if not data.endswith(b"\n") or len(data) > MPV_RESPONSE_MAX_BYTES:
+                        raise RuntimeError("mpv IPC: invalid or oversized response")
+                    response = json.loads(data)
+                    if response.get("request_id") == 1: break
         if response.get("error") != "success": raise RuntimeError(response.get("error", "mpv error"))
         return response.get("data")
 
+    def _ensure_mpv_events(self) -> None:
+        if (self.mpv_events_thread and self.mpv_events_thread.is_alive()
+                and getattr(self, "mpv_events_process", None) is self.mpv): return
+        self.mpv_events_connected.clear()
+        self.mpv_event_stop.clear()
+        process = self.mpv
+        self.mpv_events_process = process
+        self.mpv_events_thread = threading.Thread(
+            target=lambda: self._mpv_events(process), daemon=True)
+        self.mpv_events_thread.start()
+        self.mpv_events_connected.wait(.5)
+
+    def _mpv_events(self, process: subprocess.Popen | None) -> None:
+        while (not self.mpv_event_stop.is_set() and process and process is self.mpv
+               and process.poll() is None):
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(.5)
+                    sock.connect(str(MPV_SOCKET))
+                    self.mpv_events_connected.set()
+                    buffer = bytearray()
+                    started_id = None
+                    while not self.mpv_event_stop.is_set() and process is self.mpv:
+                        try: chunk = sock.recv(NETWORK_CHUNK_BYTES)
+                        except socket.timeout: continue
+                        if not chunk: break
+                        buffer.extend(chunk)
+                        while b"\n" in buffer:
+                            line, _, rest = buffer.partition(b"\n")
+                            buffer = bytearray(rest)
+                            if len(line) > MPV_RESPONSE_MAX_BYTES:
+                                raise ValueError("mpv event exceeds size limit")
+                            event = json.loads(line)
+                            with self.control_lock:
+                                if process is not self.mpv: break
+                                if event.get("event") == "start-file":
+                                    started_id = event.get("playlist_entry_id")
+                                elif event.get("event") == "file-loaded":
+                                    self._mpv_file_loaded(started_id)
+                                elif event.get("event") == "end-file":
+                                    self._mpv_end_file(event)
+                        if len(buffer) > MPV_RESPONSE_MAX_BYTES:
+                            raise ValueError("mpv event exceeds size limit")
+            except Exception:
+                pass
+            finally:
+                if process is self.mpv: self.mpv_events_connected.clear()
+            self.mpv_event_stop.wait(.2)
+
+    def _mpv_file_loaded(self, entry_id: int | None) -> None:
+        if entry_id is None: return
+        with self.control_lock:
+            with self.lock:
+                if entry_id == self.active_entry_id:
+                    ready = getattr(self, "load_ready", None)
+                    if ready: ready.set()
+                    return
+                prepared = self.prepared_entry
+                if (not prepared or entry_id != prepared["id"]
+                        or prepared["signature"] != self._preload_signature_locked()
+                        or self.state.get("stopped")): return
+            self._finish_playback_reporting(finished=True)
+            with self.lock:
+                self.index = prepared["index"]
+                self.detached_track = None
+                self.play_generation += 1
+                generation = self.play_generation
+                self.active_entry_id = entry_id
+                self.active_cache_path = prepared["path"]
+                self.prepared_entry = None
+                self.preload_candidate = None
+            meta = self._metadata(prepared["track"])
+            try:
+                self._mpv_command(["set_property", "force-media-title", f"{meta['title']} — {meta['artist']}"])
+            except Exception: pass
+            self._activate_track(prepared["track"], generation)
+
+    def _mpv_end_file(self, event: dict[str, Any]) -> None:
+        with self.control_lock:
+            with self.lock:
+                entry_id = event.get("playlist_entry_id")
+                prepared = self.prepared_entry
+                if (prepared and entry_id == prepared["id"]
+                        and event.get("reason") == "error"
+                        and prepared["signature"] == self._preload_signature_locked()):
+                    failed = prepared
+                else: failed = None
+                if not failed and entry_id != self.active_entry_id: return
+                if not failed and self.state.get("loadingKind") == "track" and self.state.get("loading"):
+                    self.pending_end_file = (self.play_generation, event)
+                    return
+                if not failed and self.state.get("stopped"): return
+                generation = self.play_generation
+                position = self._int(self.state.get("position"))
+                duration = self._int(self.state.get("duration"))
+                elapsed = min(2.0, max(0, time.time() - self.state.get("positionObservedAt", time.time())))
+                finished = (event.get("reason") == "eof"
+                            and (duration <= 2 or position + elapsed >= duration - 2))
+                paused = not self.state.get("playing")
+            if failed:
+                self.audio_cache.invalidate(failed["path"])
+                with self.lock: self.index = failed["index"]
+                self._play_current()
+            elif event.get("reason") in ("eof", "error"):
+                if finished and prepared and prepared["signature"] == self._preload_signature_locked():
+                    self._finish_playback_reporting(finished=True)
+                    with self.lock:
+                        self.completed_generation = generation
+                        self.had_file = False
+                    # mpv advances its own playlist; file-loaded commits the queue index.
+                elif finished:
+                    self._complete_playback(generation)
+                else:
+                    if self.active_cache_path:
+                        self.audio_cache.invalidate(self.active_cache_path)
+                    self._reset_preload()
+                    try: self._mpv_command(["stop"], False)
+                    except Exception: pass
+                    self._play_current(resume_position=position, start_paused=paused)
+
+    def _complete_playback(self, generation: int) -> None:
+        with getattr(self, "control_lock", self.lock):
+            with self.lock:
+                if (generation != getattr(self, "play_generation", 0)
+                        or generation == getattr(self, "completed_generation", -1)
+                        or self.state.get("stopped")): return
+                self.completed_generation = generation
+                self.had_file = False
+            self.next(automatic=True)
+
+    def _activate_track(self, track: Any, generation: int, position: float = 0,
+                        start_paused: bool = False) -> None:
+        meta = self._metadata(track)
+        with self.lock:
+            if generation != self.play_generation: return
+            track_id = self._track_id(track)
+            self.state.update(meta)
+            self.state.update(playing=not start_paused, stopped=False, position=position,
+                positionObservedAt=time.time(), liked=track_id in self.liked_ids,
+                disliked=track_id in self.disliked_ids, error="")
+            if self.state.get("loadingKind") == "track":
+                self.state.update(loading=False, loadingKind="", loadingStage="")
+            self.had_file = True; self.active_ticks = 0; self.consecutive_failures = 0
+            self.last_playback_position = position
+            self.last_playback_progress_at = time.monotonic()
+        if not start_paused: self._begin_playback_reporting(track)
+        self._publish_mpris()
+        # Covers may require network I/O; never block the event reader on them.
+        def notify() -> None:
+            with self.lock:
+                if generation != self.play_generation: return
+            self._notify_track(meta)
+        threading.Thread(target=notify, daemon=True).start()
+        self._save_state(True)
+        self._maybe_extend_collection()
+        self._schedule_preload()
+        pending = getattr(self, "pending_end_file", None)
+        self.pending_end_file = None
+        if pending and pending[0] == generation: self._mpv_end_file(pending[1])
+
     def _wait_mpv_ready(self, timeout: float = AUDIO_STREAM_TIMEOUT) -> None:
         deadline = time.monotonic() + timeout
+        ready = getattr(self, "load_ready", None)
+        generation = self.play_generation
         while time.monotonic() < deadline:
+            if generation != self.play_generation: raise RuntimeError("playback cancelled")
+            connection = getattr(self, "mpv_events_connected", None)
+            if ready and connection and connection.is_set():
+                if ready.wait(.02): return
+                continue
             try:
                 idle = bool(self._mpv_command(["get_property", "idle-active"], False))
                 duration = float(self._mpv_command(["get_property", "duration"], False) or 0)
@@ -3570,78 +3930,91 @@ class Player:
             except Exception:
                 idle = True
                 duration = 0.0
-            time.sleep(.15)
+            time.sleep(.01)
         raise RuntimeError("mpv не успел открыть аудиопоток")
 
     def _play_current(self, resume_position: int = 0, start_paused: bool = False,
                       initial_url: str = "") -> None:
-        with self.lock:
-            self.detached_track = None
-            self.play_generation += 1; generation = self.play_generation
+        control = getattr(self, "control_lock", self.lock)
+        with control:
+            self._reset_preload()
+            with self.lock:
+                if not (0 <= self.index < len(self.queue)): return
+                self.detached_track = None
+                self.play_generation += 1; generation = self.play_generation
+                track = self.queue[self.index]
+                self.had_file = False
+                self.active_entry_id = None
+                self.active_cache_path = None
+                if self.state.get("loadingKind", "") in ("", "track"):
+                    self.state.update(loading=True, loadingKind="track", error="")
         def load() -> None:
             last_error: Exception | None = None
-            for attempt in range(AUDIO_STREAM_ATTEMPTS):
+            cache = getattr(self, "audio_cache", None)
+            identity = self._cache_identity(track) if cache else None
+            with control:
+                with self.lock:
+                    if generation != self.play_generation: return
+                if cache and identity: cache.protect({identity})
+            cached = cache.lookup(identity) if cache and identity else None
+            attempts = ([-1] if cached else []) + list(range(AUDIO_STREAM_ATTEMPTS))
+            for attempt in attempts:
+                local = attempt == -1
                 try:
                     with self.lock:
-                        if generation != self.play_generation or not (0 <= self.index < len(self.queue)): return
-                        track = self.queue[self.index]
-                        if self.state.get("loadingKind", "") in ("", "track"):
-                            self.state.update(loading=True, loadingKind="track", error="")
-                    meta = self._metadata(track)
-                    with self.lock:
+                        if generation != self.play_generation: return
                         if self.state.get("loadingKind") == "track":
                             self.state["loadingStage"] = "downloadInfo"
-                    url = initial_url if attempt == 0 and initial_url else self._url(
-                        track, variant=attempt)
-                    with self.lock:
-                        if self.state.get("loadingKind") == "track":
-                            self.state["loadingStage"] = "audioStream"
-                    self._mpv_command(["loadfile", url, "replace"])
+                    url = (str(cached) if local else initial_url if attempt == 0 and initial_url
+                           else self._url(track, variant=attempt))
+                    with control:
+                        with self.lock:
+                            if generation != self.play_generation: return
+                            if cache: self.load_ready = threading.Event()
+                            if self.state.get("loadingKind") == "track":
+                                self.state["loadingStage"] = "audioStream"
+                        self._mpv_command(["loadfile", url, "replace"])
+                        if cache:
+                            playlist = self._mpv_command(["get_property", "playlist"], False) or []
+                            with self.lock:
+                                self.active_entry_id = playlist[0]["id"] if playlist else None
+                                self.active_cache_path = cached if local else None
                     self._wait_mpv_ready()
-                    self._mpv_command(["set_property", "force-media-title", f"{meta['title']} — {meta['artist']}"])
-                    if resume_position > 0: self._mpv_command(["seek", resume_position, "absolute"])
-                    self._mpv_command(["set_property", "mute", self.muted])
-                    self._mpv_command(["set_property", "pause", bool(start_paused)])
-                    position = float(self._mpv_command(
-                        ["get_property", "time-pos"], False) or resume_position)
-                    position_observed_at = time.time()
-                    with self.lock:
-                        if generation != self.play_generation: return
-                        track_id = self._track_id(track)
-                        self.state.update(meta)
-                        self.state.update(playing=not start_paused, stopped=False,
-                            position=position, positionObservedAt=position_observed_at,
-                            duration=self._int(getattr(track, "duration_ms", 0)) // 1000,
-                            liked=track_id in self.liked_ids, disliked=track_id in self.disliked_ids,
-                            error="")
-                        if self.state.get("loadingKind") == "track":
-                            self.state.update(loading=False, loadingKind="", loadingStage="")
-                        # The monitor marks the file active only after mpv has
-                        # actually left its transient idle state. This avoids
-                        # skipping a restored track while it is still opening.
-                        self.had_file = True; self.active_ticks = 0; self.consecutive_failures = 0
-                        self.last_playback_position = position
-                        self.last_playback_progress_at = time.monotonic()
-                    if not start_paused: self._begin_playback_reporting(track)
-                    self._publish_mpris(); self._notify_track(meta)
-                    self._save_state(True); self._maybe_extend_collection(); return
+                    with control:
+                        with self.lock:
+                            if generation != self.play_generation: return
+                        if local:
+                            actual_duration = float(self._mpv_command(["get_property", "duration"], False) or 0)
+                            expected_duration = float(getattr(track, "duration_ms", 0) or 0) / 1000
+                            if actual_duration and actual_duration < expected_duration - max(5, expected_duration * .02):
+                                raise RuntimeError("cached audio is truncated")
+                        meta = self._metadata(track)
+                        self._mpv_command(["set_property", "force-media-title", f"{meta['title']} — {meta['artist']}"])
+                        if resume_position > 0: self._mpv_command(["seek", resume_position, "absolute"])
+                        self._mpv_command(["set_property", "mute", self.muted])
+                        self._mpv_command(["set_property", "pause", bool(start_paused)])
+                        position = float(self._mpv_command(
+                            ["get_property", "time-pos"], False) or resume_position)
+                        self._activate_track(track, generation, position, start_paused)
+                    return
                 except Exception as exc:
                     last_error = exc
-                    with self.lock:
-                        if generation != self.play_generation:
-                            return
-                    try:
-                        self._mpv_command(["stop"], False)
-                    except Exception:
-                        pass
-            with self.lock:
-                self.consecutive_failures += 1
-                should_advance = bool(self.queue) and self.consecutive_failures < len(self.queue)
-            if should_advance:
-                self.next()
-                return
-            self._set_error(
-                f"Не удалось воспроизвести трек после {AUDIO_STREAM_ATTEMPTS} попыток: {last_error}")
+                    with control:
+                        with self.lock:
+                            if generation != self.play_generation: return
+                        if local and cache and cached: cache.invalidate(cached)
+                        try: self._mpv_command(["stop"], False)
+                        except Exception: pass
+            with control:
+                with self.lock:
+                    if generation != self.play_generation: return
+                    self.consecutive_failures += 1
+                    should_advance = bool(self.queue) and self.consecutive_failures < len(self.queue)
+                if should_advance:
+                    self.next()
+                    return
+                self._set_error(
+                    f"Не удалось воспроизвести трек после {AUDIO_STREAM_ATTEMPTS} попыток: {last_error}")
         threading.Thread(target=load, daemon=True).start()
 
     def _notification_cover(self, url: str) -> str:
@@ -3691,9 +4064,13 @@ class Player:
         if self.preferences.get("notifications") != "all": return
         try:
             icon = self._notification_cover(str(metadata.get("artUrl", "")))
-            subprocess.Popen(["/usr/bin/notify-send", "--app-name=Yandex Music",
-                f"--icon={icon}", str(metadata.get("title", "Яндекс Музыка")),
-                str(metadata.get("artist", ""))], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with getattr(self, "control_lock", self.lock):
+                with self.lock:
+                    if (metadata.get("trackId") != self.state.get("trackId")
+                            or self.state.get("stopped")): return
+                subprocess.Popen(["/usr/bin/notify-send", "--app-name=Yandex Music",
+                    f"--icon={icon}", str(metadata.get("title", "Яндекс Музыка")),
+                    str(metadata.get("artist", ""))], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             return
 
@@ -3702,6 +4079,7 @@ class Player:
         current = str(self.preferences.get("playbackMode", "repeatQueue"))
         self.set_preference("playbackMode", modes[(modes.index(current) + 1) % len(modes)])
 
+    @playback_control
     def pause(self) -> None:
         try:
             idle = bool(self._mpv_command(["get_property", "idle-active"]))
@@ -3749,46 +4127,43 @@ class Player:
             self._save_state(True)
         except Exception as exc: self._set_error(exc)
 
+    @playback_control
     def next(self, automatic: bool = False) -> None:
-        end_queue = False
         with self.lock:
             if not self.queue: return
+            target = self._next_target_locked(automatic)
+            prepared = getattr(self, "prepared_entry", None)
+            use_prepared = (prepared and isinstance(target, int)
+                            and target == prepared["index"]
+                            and prepared["signature"] == self._preload_signature_locked())
         self._finish_playback_reporting(finished=automatic)
-        with self.lock:
-            if not self.queue: return
-            mode = str(self.preferences.get("playbackMode", "repeatQueue"))
-            detached = self.detached_track is not None
-            extend_radio = False
-            extend_collection = False
-            extend_artist = False
-            if automatic and mode == "repeatTrack" and not detached:
+        if use_prepared:
+            # Commit metadata only when mpv actually starts this playlist entry.
+            with self.lock:
+                self.index = target
+                self.play_generation += 1
+                self.active_entry_id = None
+                self.had_file = False
+                prepared["signature"] = self._preload_signature_locked()
+            try:
+                self._mpv_command(["set_property", "pause", False], False)
+                self._mpv_command(["playlist-next", "force"], False)
+                return
+            except Exception:
                 pass
-            elif self.radio_station and self.index >= len(self.queue) - 1:
-                extend_radio = True
-            elif self.queue_source and self.index >= len(self.queue) - 1:
-                extend_collection = True
-            elif (self.queue_artist_id and self.queue_artist_has_more
-                  and self.index >= len(self.queue) - 1):
-                extend_artist = True
-            elif mode == "shuffle" and len(self.queue) > 1:
-                choices = [i for i in range(len(self.queue)) if i != self.index]
-                self.index = random.choice(choices)
-            elif self.index < len(self.queue) - 1:
-                self.index += 1
-            elif mode == "repeatQueue":
-                self.index = 0
-            else:
-                end_queue = True
-        if end_queue:
+        self._reset_preload()
+        if target == "end":
             self.stop(); return
-        if extend_radio:
+        if target == "radio":
             self._extend_radio(advance=True); return
-        if extend_collection:
+        if target == "collection":
             self._extend_collection(advance=True); return
-        if extend_artist:
+        if target == "artist":
             self._extend_artist_queue(advance=True, automatic=automatic); return
+        with self.lock: self.index = target
         self._save_state(True); self._play_current()
 
+    @playback_control
     def previous(self) -> None:
         try:
             if float(self._mpv_command(["get_property", "time-pos"], False) or 0) > 5:
@@ -3806,7 +4181,20 @@ class Player:
                 self.index = (self.index - 1) % len(self.queue)
         self._save_state(True); self._play_current()
 
+    @playback_control
     def stop(self) -> None:
+        with self.lock:
+            self.play_generation = getattr(self, "play_generation", 0) + 1
+            self.active_entry_id = None
+            self.active_cache_path = None
+            self.queue_advance_pending = False
+            self.radio_advance_pending = False
+            self.queue_generation = getattr(self, "queue_generation", 0) + 1
+            self.queue_extending = False
+            self.radio_extending = False
+            self.state.update(loading=False, loadingKind="", loadingStage="")
+        self._reset_preload()
+        if getattr(self, "audio_cache", None): self.audio_cache.protect(set())
         self._finish_playback_reporting(finished=False)
         try: self._mpv_command(["stop"], False)
         except Exception:
@@ -3820,8 +4208,21 @@ class Player:
                               positionObservedAt=time.time())
         self._publish_mpris(); self._save_state(True)
 
+    @playback_control
     def shutdown(self) -> None:
         self._save_state(True)
+        # A service restart must retain position and the auto-resume flag.
+        # Invalidate asynchronous work without persisting a user-visible Stop.
+        with self.lock:
+            self.play_generation = getattr(self, "play_generation", 0) + 1
+            self.queue_generation = getattr(self, "queue_generation", 0) + 1
+            self.active_entry_id = None
+            self.had_file = False
+            self.queue_advance_pending = False
+            self.radio_advance_pending = False
+        self._reset_preload()
+        if getattr(self, "audio_cache", None): self.audio_cache.close()
+        if getattr(self, "mpv_event_stop", None): self.mpv_event_stop.set()
         try: self._mpv_command(["quit"], False)
         except Exception:
             return
@@ -3831,11 +4232,24 @@ class Player:
             time.sleep(1)
             try:
                 if not self.mpv or self.mpv.poll() is not None or not MPV_SOCKET.exists(): continue
+                if getattr(self, "prepared_entry", None):
+                    with self.control_lock: self._sync_prepared()
                 with self.lock:
                     if self.state.get("loadingKind") == "track" and self.state["loading"]: continue
+                    if self.state.get("stopped"): continue
+                    generation = getattr(self, "play_generation", 0)
+                    event_connection = getattr(self, "mpv_events_connected", None)
+                    events_active = event_connection and event_connection.is_set()
                 idle = bool(self._mpv_command(["get_property", "idle-active"], False))
                 if idle:
                     with self.lock:
+                        if generation != getattr(self, "play_generation", 0): continue
+                        if events_active and getattr(self, "idle_generation", None) != generation:
+                            # Give queued end-file events the first chance; recover
+                            # if a healthy-looking connection missed the event.
+                            self.idle_generation = generation
+                            continue
+                        if generation == getattr(self, "completed_generation", -1): continue
                         was_active = self.had_file
                         position = self._int(self.state["position"])
                         duration = self._int(self.state["duration"])
@@ -3845,7 +4259,7 @@ class Player:
                         self._update_playback_clock_locked(False)
                     if was_active:
                         if duration > 0 and position >= duration - 5:
-                            self.next(automatic=True)
+                            self._complete_playback(generation)
                         else:
                             # An unexpected idle state means the stream was
                             # interrupted, not that the track ended. Reopen a
@@ -3861,6 +4275,9 @@ class Player:
                     self._mpv_command(["get_property", "volume"], False) or self.volume))
                 muted = bool(self._mpv_command(["get_property", "mute"], False))
                 with self.lock:
+                    if generation != getattr(self, "play_generation", 0): continue
+                    if getattr(self, "prepared_entry", None) and not self.had_file: continue
+                    self.idle_generation = None
                     now = time.monotonic()
                     if paused or position > self.last_playback_position + .2:
                         self.last_playback_progress_at = now
@@ -3879,6 +4296,7 @@ class Player:
                     self._play_current(resume_position=int(position))
                     continue
                 self._publish_mpris(); self._save_state()
+                self._schedule_preload()
             except Exception:
                 continue
 

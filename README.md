@@ -40,6 +40,7 @@ A native Yandex Music mini-player for the [Omarchy](https://omarchy.org/) shell.
 - Track radio with a sequence of similar recommendations and radio feedback
 - On-demand release details and recording credits
 - Ordered, shuffle, repeat queue, and repeat track modes
+- Bounded audio cache and background preparation of the next selected track
 - System media keys and privacy-safe MPRIS integration
 - Persistent queue, position, volume, pause state, and preferences
 - Configurable bar layout, artwork shape, marquee text, and notifications
@@ -69,6 +70,14 @@ Long artist/title text can be truncated or scrolled as one continuous line. The 
 - Click an artist or album link to open its page in the Search catalog
 
 Opening “My Likes” or a personal library playlist does **not** interrupt the current track. A separate list is loaded and playback starts only after you select a track. Large library collections load in batches of 50 tracks, with the next page fetched automatically when you reach the end of the list. Recently opened collections and all pages already fetched for them are restored instantly from a short-lived in-memory cache. Lyrics and detailed track information load only on demand and remain in memory for the current and a few recently opened tracks.
+
+### Audio caching
+
+During playback, one background downloader prepares the next selected track, then caches the current track when it was opened from the network. This can download the current track a second time; preparing the next track takes priority. Completed files play locally, including when the network goes away after preparation. Automatic transitions use mpv's playlist and file events instead of waiting for the one-second position poll. Shuffle reuses the candidate chosen for preparation; manual Next still advances in repeat-track mode.
+
+The audio cache is limited to **256 MiB**, including temporary downloads, with a **64 MiB** limit per file. Least recently used files are evicted while the current and next tracks are protected. Partial or damaged files are discarded, and cache/network failures fall back to ordinary streaming. This is a playback cache, not an offline library. Tracks that have not finished downloading and radio boundaries requiring another batch may still have a network delay. Preloading does not send listening feedback or show a loading indicator.
+
+Files are separated by account, quality, codec, and bitrate in `$XDG_CACHE_HOME/omarchy-yandex-music/audio`, or `~/.cache/omarchy-yandex-music/audio` when `XDG_CACHE_HOME` is unset or relative. The installer captures this path in the service environment and grants write access only to the audio subdirectory alongside the existing configuration/runtime allowances. Rerun `./install.sh --backend-only` after changing `XDG_CACHE_HOME`. Sign-out removes that account's audio; uninstall removes the audio cache even without `--purge`. To clear it manually, stop the service, remove this directory, recreate it with mode `700`, and start the service again.
 
 ### Library
 

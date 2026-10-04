@@ -12,7 +12,8 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.config/omarchy-yandex-music %t
+Environment=XDG_CACHE_HOME=%h/.cache
+ReadWritePaths=%h/.config/omarchy-yandex-music %t %h/.cache/omarchy-yandex-music/audio
 
 [Install]
 WantedBy=default.target
