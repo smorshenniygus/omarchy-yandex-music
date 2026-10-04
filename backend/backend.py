@@ -66,6 +66,19 @@ DEFAULT_PREFERENCES = {
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
 SOCKET = RUNTIME / "omarchy-yandex-music.sock"
 MPV_SOCKET = RUNTIME / "omarchy-yandex-music-mpv.sock"
+# The UI slider stays linear (0-100) while the mpv gain grows more slowly, so
+# low settings remain audible and the slider range feels even.
+VOLUME_CURVE_EXPONENT = 0.6
+
+
+def volume_percent_to_gain(percent: float) -> float:
+    p = max(0.0, min(100.0, float(percent))) / 100.0
+    return 100.0 * (p ** VOLUME_CURVE_EXPONENT)
+
+
+def gain_to_volume_percent(gain: float) -> int:
+    g = max(0.0, min(100.0, float(gain))) / 100.0
+    return int(round(100.0 * (g ** (1.0 / VOLUME_CURVE_EXPONENT))))
 API_STATUS_URL = "https://api.music.yandex.net/account/status"
 NETWORK_PROBE_TTL = 30
 LIBRARY_PAGE_SIZE = 50
@@ -3852,7 +3865,8 @@ class Player:
             "--audio-client-name=Yandex Music",
             # Reuse one HTTP connection for the range requests mpv makes while opening a stream.
             "--stream-lavf-o=multiple_requests=1",
-            f"--input-ipc-server={MPV_SOCKET}", "--force-window=no", f"--volume={self.volume}"],
+            f"--input-ipc-server={MPV_SOCKET}", "--force-window=no",
+            f"--volume={volume_percent_to_gain(self.volume)}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(60):
             if MPV_SOCKET.exists():
@@ -4244,7 +4258,7 @@ class Player:
         self.volume = max(0, min(100, self._int(value)))
         self.muted = False
         try:
-            self._mpv_command(["set_property", "volume", self.volume])
+            self._mpv_command(["set_property", "volume", volume_percent_to_gain(self.volume)])
             self._mpv_command(["set_property", "mute", False])
         except Exception as exc: self._set_error(exc)
         with self.lock: self.state.update(volume=self.volume, muted=False)
@@ -4402,8 +4416,9 @@ class Player:
                 position = self._float(self._mpv_command(["get_property", "time-pos"], False))
                 position_observed_at = time.time()
                 duration = self._int(self._float(self._mpv_command(["get_property", "duration"], False)))
-                volume = self._int(self._float(
-                    self._mpv_command(["get_property", "volume"], False) or self.volume))
+                volume = gain_to_volume_percent(self._float(
+                    self._mpv_command(["get_property", "volume"], False)
+                    or volume_percent_to_gain(self.volume)))
                 muted = bool(self._mpv_command(["get_property", "mute"], False))
                 with self.lock:
                     if generation != getattr(self, "play_generation", 0): continue
