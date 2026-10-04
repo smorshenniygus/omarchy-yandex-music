@@ -6,6 +6,24 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-04
+
+### Added
+
+- Bounded on-disk audio cache with background preparation of the next selected track and local playback of completed downloads
+- A 256 MiB total budget and 64 MiB per-file limit, LRU eviction, protection of current/next tracks, account/quality/codec isolation, and atomic publication of complete files
+
+### Changed
+
+- Automatic track transitions use mpv playlist entries and file events instead of the one-second playback poll; shuffle reuses the prepared candidate
+- Installation delivers the audio-cache module, tracks backend changes independently of the version marker, and grants the service write access only to its configured audio-cache directory
+- Sign-out clears the account's cached audio; uninstall also removes the previously configured cache after an XDG cache-path change
+
+### Fixed
+
+- My Wave and track radio fetch the next batch while the last queued track is playing, allowing preparation of its successor before the current batch ends
+- Incomplete or damaged downloads are discarded; cache and download failures retain ordinary streaming as a fallback
+
 ## [0.8.2] - 2026-09-28
 
 ### Security
@@ -226,6 +244,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - Initial public release
 - Device OAuth, background `mpv` playback, library, search, queue, and persistent state
 
+[0.9.0]: https://github.com/vornashev/omarchy-yandex-music/compare/v0.8.2...v0.9.0
 [0.8.2]: https://github.com/vornashev/omarchy-yandex-music/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/vornashev/omarchy-yandex-music/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/vornashev/omarchy-yandex-music/compare/v0.7.4...v0.8.0
