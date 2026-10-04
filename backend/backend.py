@@ -1345,6 +1345,14 @@ class Player:
                 self._set_error(f"Не удалось запустить радио по треку: {exc}")
         self._loading(load, "radio")
 
+    def _maybe_extend_radio(self) -> None:
+        with self.lock:
+            should_extend = (bool(self.radio_station) and bool(self.queue)
+                             and self.detached_track is None
+                             and self.index == len(self.queue) - 1)
+        if should_extend:
+            self._extend_radio()
+
     def _extend_radio(self, advance: bool = False) -> None:
         with self.lock:
             if not self.radio_station or not self.client: return
@@ -3907,6 +3915,7 @@ class Player:
             self._notify_track(meta)
         threading.Thread(target=notify, daemon=True).start()
         self._save_state(True)
+        self._maybe_extend_radio()
         self._maybe_extend_collection()
         self._schedule_preload()
         pending = getattr(self, "pending_end_file", None)

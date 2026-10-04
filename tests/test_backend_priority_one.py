@@ -136,6 +136,7 @@ class PriorityOneTests(unittest.TestCase):
                                            "trackId": str(track.id), "duration": 180}
         player._publish_mpris = lambda: None
         player._notify_track = lambda meta: None
+        player._maybe_extend_radio = lambda: None
         player._maybe_extend_collection = lambda: None
         player._wait_mpv_ready = lambda: None
         player.commands = []
@@ -580,6 +581,97 @@ class PriorityOneTests(unittest.TestCase):
 
         self.assertEqual(reopened, [{"resume_position": 35}])
         self.assertEqual(player.next_calls, 0)
+
+    def make_radio_prefetch_player(self):
+        player = self.make_audio_player(radio=True)
+        del player._maybe_extend_radio
+        player.queue = [SimpleNamespace(id=str(i), duration_ms=180_000)
+                        for i in range(42, 47)]
+        player.radio_track_batches = {track.id: "batch" for track in player.queue}
+        player.radio_extending = False
+        player.radio_advance_pending = False
+        player.telemetry_queue = queue.Queue()
+        player.state.update(loading=False, loadingKind="")
+        player.client.radio_result = SimpleNamespace(
+            sequence=[SimpleNamespace(track=SimpleNamespace(id=str(i), duration_ms=180_000))
+                      for i in range(47, 52)], batch_id="next-batch")
+        return player
+
+    def test_entering_last_radio_track_prefetches_batch_and_prepares_next_audio(self):
+        for manual in (False, True):
+            with self.subTest(manual=manual):
+                player = self.make_radio_prefetch_player()
+                player.index = 3
+                with self.immediate_threads():
+                    player._activate_track(player.queue[3], player.play_generation)
+                self.assertFalse(any(call[0] == "radio_tracks" for call in player.client.calls))
+                player.prepared_entry = {
+                    "signature": player._preload_signature_locked(), "index": 4,
+                    "id": 11, "path": Path("/tmp/fifth.audio"), "track": player.queue[4]}
+                if manual:
+                    del player.next
+                    player.next()
+                with self.immediate_threads():
+                    player._mpv_file_loaded(11)
+
+                self.assertEqual(player.index, 4)
+                self.assertEqual(len(player.queue), 10)
+                self.assertEqual(player.state["trackId"], "46")
+                self.assertFalse(player.state["loading"])
+                radio_calls = [call for call in player.client.calls if call[0] == "radio_tracks"]
+                self.assertEqual(radio_calls, [("radio_tracks", "user:onyourwave", {"queue": "46"})])
+                self.assertEqual(player.radio_track_batches["47"], "next-batch")
+                requests = player.audio_cache.schedule.call_args.args[0]
+                self.assertEqual(player.preload_candidate["index"], 5)
+                self.assertTrue(requests[0].valid())
+                requests[0].ready(Path("/tmp/sixth.audio"))
+                self.assertEqual(player.prepared_entry["index"], 5)
+                self.assertEqual(player.prepared_entry["track"].id, "47")
+                self.assertIn(["loadfile", "/tmp/sixth.audio", "append"], player.commands)
+
+    def test_radio_prefetch_coalesces_and_advances_if_next_is_requested_while_loading(self):
+        player = self.make_radio_prefetch_player()
+        player.index = 4
+        pending = []
+        player._play_current = Mock()
+        del player.next
+        with patch.object(backend.threading, "Thread",
+                          side_effect=lambda target, daemon: SimpleNamespace(start=lambda: pending.append(target))):
+            player._maybe_extend_radio()
+            player._maybe_extend_radio()
+            self.assertFalse(player.state["loading"])
+            player.next()
+        self.assertEqual(len(pending), 1)
+        pending[0]()
+        self.assertEqual(player.index, 5)
+        self.assertEqual(len(player.queue), 10)
+        self.assertFalse(player.radio_extending)
+        player._play_current.assert_called_once_with()
+
+    def test_radio_prefetch_ignores_result_after_queue_is_replaced(self):
+        player = self.make_radio_prefetch_player()
+        player.index = 4
+        pending = []
+        with patch.object(backend.threading, "Thread",
+                          side_effect=lambda target, daemon: SimpleNamespace(start=lambda: pending.append(target))):
+            player._maybe_extend_radio()
+        player.queue_generation += 1
+        player.queue = [self.track]
+        player.radio_station = ""
+        pending[0]()
+        self.assertEqual(player.queue, [self.track])
+        player.audio_cache.schedule.assert_not_called()
+
+    def test_radio_prefetch_does_not_extend_regular_queue_or_detached_track(self):
+        player = self.make_radio_prefetch_player()
+        player.index = 4
+        player._extend_radio = Mock()
+        player.detached_track = self.track
+        player._maybe_extend_radio()
+        player.detached_track = None
+        player.radio_station = ""
+        player._maybe_extend_radio()
+        player._extend_radio.assert_not_called()
 
     def test_radio_batch_hands_loading_to_next_track(self):
         player = self.make_player()
