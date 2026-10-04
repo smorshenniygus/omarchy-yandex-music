@@ -1,4 +1,9 @@
+import json
+import tempfile
+import threading
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from backend import backend
 
@@ -18,6 +23,32 @@ class VolumeCurveTests(unittest.TestCase):
         self.assertEqual(backend.volume_percent_to_gain(-5), 0)
         self.assertEqual(backend.volume_percent_to_gain(150), 100)
         self.assertEqual(backend.gain_to_volume_percent(130), 100)
+
+
+class VolumePreferenceTests(unittest.TestCase):
+    def test_bar_volume_visibility_persists_without_changing_player_volume(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            preferences_file = Path(temporary) / "preferences.json"
+            preferences_file.write_text(json.dumps({"showControls": False}))
+            with patch.object(backend, "PREFERENCES_FILE", preferences_file):
+                player = backend.Player.__new__(backend.Player)
+                player.lock = threading.RLock()
+                player.preferences = player._load_preferences()
+                player.state = {"volume": 37, "muted": True}
+
+                # Existing installations retain their visible bar volume control.
+                self.assertTrue(player.preferences["showVolume"])
+                for value, expected in (("false", False), ("true", True)):
+                    with self.subTest(value=value):
+                        player.set_preference("showVolume", value)
+                        self.assertIs(player.state["preferences"]["showVolume"], expected)
+                        saved = json.loads(preferences_file.read_text())
+                        self.assertIs(saved["showVolume"], expected)
+                        restored = player._load_preferences()
+                        self.assertIs(restored["showVolume"], expected)
+                        self.assertFalse(restored["showControls"])
+                        self.assertEqual(player.state["volume"], 37)
+                        self.assertTrue(player.state["muted"])
 
 
 if __name__ == "__main__":

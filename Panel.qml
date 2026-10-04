@@ -1065,10 +1065,10 @@ Panel {
         contentHeight: content.implicitHeight
         clip: true
         boundsBehavior: Flickable.StopAtBounds
-        interactive: !root.coverExpanded && contentHeight > height
+        interactive: !root.coverExpanded && !root.coverTransitioning && contentHeight > height
           && (root.settingsOpen || root.page !== 2)
         ScrollBar.vertical: ScrollBar {
-          policy: root.coverExpanded || (!root.settingsOpen && root.page === 2)
+          policy: root.coverExpanded || root.coverTransitioning || (!root.settingsOpen && root.page === 2)
             ? ScrollBar.AlwaysOff : ScrollBar.AsNeeded
           topPadding: root.settingsOpen ? Style.space(34) : 0
           bottomPadding: Style.space(4)
@@ -1079,14 +1079,28 @@ Panel {
           // Never derive layout width from contentHeight: switching pages or
           // animating the cover may toggle the scrollbar and create a feedback loop.
           property real stableGutter: Style.space(14)
+          // fittedContentHeight includes the card's padding and border. Use a
+          // screen-capped budget, not this Column's height, to avoid a size loop.
+          readonly property real viewportBudget: Math.max(0,
+            panel.fittedContentHeight(Style.space(620), Style.space(620))
+              - panel.verticalContentInset)
+          readonly property real regularErrorHeight: root.hasVisibleError
+            ? errorContent.implicitHeight + Style.space(20) + spacing : 0
+          readonly property real expandedViewportBudget: Math.min(viewportBudget,
+            root.coverStablePanelHeight > 0 && (root.coverExpanded || root.coverTransitioning)
+              ? root.coverStablePanelHeight - panel.verticalContentInset : viewportBudget)
+          readonly property real expandedCoverSize: Math.min(width, Math.max(1,
+            expandedViewportBudget - expandedPlayer.implicitHeight - spacing))
           readonly property real regularCoverBodyHeight: Style.space(68)
-            + authenticatedContent.implicitHeight
-          readonly property real expandedCoverBodyHeight: width
+            + authenticatedContent.implicitHeight + regularErrorHeight
+          readonly property real expandedCoverBodyHeight: expandedCoverSize
             + expandedPlayer.implicitHeight
-          readonly property real regularCoverHeightBalance: Math.max(0,
-            expandedCoverBodyHeight - regularCoverBodyHeight)
+          readonly property real regularCoverHeightBalance: root.settingsOpen ? 0 : Math.max(0,
+            Math.min(expandedCoverBodyHeight - regularCoverBodyHeight,
+              viewportBudget - spacing - regularCoverBodyHeight))
           readonly property real expandedCoverHeightBalance: Math.max(0,
-            regularCoverBodyHeight - expandedCoverBodyHeight)
+            Math.min(regularCoverBodyHeight - expandedCoverBodyHeight,
+              expandedViewportBudget - spacing - expandedCoverBodyHeight))
           x: stableGutter / 2
           width: panelScroll.width - stableGutter
           spacing: Style.space(12)
@@ -1095,8 +1109,15 @@ Panel {
             id: hero
             visible: !root.settingsOpen
             width: parent.width
-            height: root.coverExpanded ? width : Style.space(68)
+            height: root.coverExpanded ? content.expandedCoverSize : Style.space(68)
             spacing: root.coverExpanded ? 0 : Style.space(14)
+            leftPadding: root.coverExpanded ? (width - content.expandedCoverSize) / 2 : 0
+            Behavior on leftPadding {
+              NumberAnimation {
+                duration: root.coverTransitionDuration
+                easing.type: Easing.OutCubic
+              }
+            }
             Behavior on height {
               NumberAnimation {
                 duration: root.coverTransitionDuration
@@ -1109,7 +1130,7 @@ Panel {
 
             BorderSurface {
               id: coverSurface
-              width: root.coverExpanded ? hero.width : Style.space(68)
+              width: root.coverExpanded ? content.expandedCoverSize : Style.space(68)
               height: hero.height
               radius: root.coverExpanded ? Style.cornerRadius : Style.spacing.labelGap
               clip: true
@@ -1552,8 +1573,8 @@ Panel {
             width: parent.width
             // Keep the popup equally tall in both cover states without
             // distorting the square artwork or compacting player controls.
-            // Any difference between the two natural layouts becomes
-            // invisible space below this column.
+            // Any difference that fits the viewport becomes invisible space
+            // below this column; the inner panes absorb the remaining budget.
             height: root.coverExpanded ? 0
               : implicitHeight + content.regularCoverHeightBalance
             opacity: root.coverExpanded ? 0 : 1
@@ -1579,6 +1600,7 @@ Panel {
             }
 
             Row {
+              id: navigationTabs
               visible: !root.settingsOpen
               width: parent.width; spacing: Style.space(4)
               Repeater {
@@ -1603,6 +1625,16 @@ Panel {
             }
 
             Column {
+              id: playerPage
+              // Everything above the pane keeps its natural size, including
+              // volume and contextual errors. Only the scrolling pane shrinks.
+              // Keep a usable minimum on exceptionally short screens; the
+              // outer Flickable remains a fallback rather than clipping controls.
+              readonly property real paneHeight: Math.max(Style.space(80),
+                Math.min(Style.space(260), content.viewportBudget
+                  - Style.space(68) - content.spacing - content.regularErrorHeight
+                  - navigationTabs.height - authenticatedContent.spacing
+                  - trackPaneHeader.y - trackPaneHeader.height - spacing))
               visible: !root.settingsOpen && root.page === 0; width: parent.width; spacing: Style.space(14)
 
               Item {
@@ -1792,6 +1824,7 @@ Panel {
               }
 
               Item {
+                id: trackPaneHeader
                 visible: root.hasTrack || root.browsingLibrary
                   || root.queueListLoading || root.trackListDisplay.length > 0
                 width: parent.width
@@ -1881,7 +1914,7 @@ Panel {
               SkeletonList {
                 visible: !root.currentTrackPaneOpen && root.queueListLoading
                 width: parent.width
-                height: visible ? Style.space(260) : 0
+                height: visible ? playerPage.paneHeight : 0
                 rowCount: 5
                 foreground: root.foreground
               }
@@ -1889,7 +1922,7 @@ Panel {
               Item {
                 visible: !root.currentTrackPaneOpen && root.browsingLibrary
                   && !root.queueListLoading && root.trackListDisplay.length === 0
-                width: parent.width; height: visible ? Style.space(260) : 0
+                width: parent.width; height: visible ? playerPage.paneHeight : 0
                 Text {
                   textFormat: Text.PlainText
                   anchors.centerIn: parent
@@ -1904,7 +1937,7 @@ Panel {
                 visible: !root.currentTrackPaneOpen && !root.queueListLoading
                   && root.trackListDisplay.length > 0
                 width: parent.width
-                height: visible ? Style.space(260) : 0
+                height: visible ? playerPage.paneHeight : 0
                 clip: true
                 model: root.trackListDisplay
                 boundsBehavior: Flickable.StopAtBounds
@@ -2056,7 +2089,7 @@ Panel {
               SkeletonList {
                 visible: root.lyricsOpen && root.lyricsLoading
                 width: parent.width
-                height: visible ? Style.space(260) : 0
+                height: visible ? playerPage.paneHeight : 0
                 rowCount: 5
                 foreground: root.foreground
               }
@@ -2065,7 +2098,7 @@ Panel {
                 visible: root.lyricsOpen && !root.lyricsLoading
                   && (!root.lyricsData.available || root.lyricsLines.length === 0)
                 width: parent.width
-                height: visible ? Style.space(260) : 0
+                height: visible ? playerPage.paneHeight : 0
 
                 Column {
                   anchors.centerIn: parent
@@ -2097,7 +2130,7 @@ Panel {
                 visible: root.lyricsOpen && !root.lyricsLoading
                   && root.lyricsData.available && root.lyricsLines.length > 0
                 width: parent.width
-                height: visible ? Style.space(260) : 0
+                height: visible ? playerPage.paneHeight : 0
                 clip: true
                 model: root.lyricsLines
                 boundsBehavior: Flickable.StopAtBounds
@@ -2170,7 +2203,7 @@ Panel {
               SkeletonList {
                 visible: root.trackInfoOpen && root.trackInfoLoading
                 width: parent.width
-                height: visible ? Style.space(260) : 0
+                height: visible ? playerPage.paneHeight : 0
                 rowCount: 5
                 foreground: root.foreground
               }
@@ -2179,7 +2212,7 @@ Panel {
                 visible: root.trackInfoOpen && !root.trackInfoLoading
                   && root.trackInfoRows.length === 0
                 width: parent.width
-                height: visible ? Style.space(260) : 0
+                height: visible ? playerPage.paneHeight : 0
 
                 Column {
                   anchors.centerIn: parent
@@ -2211,7 +2244,7 @@ Panel {
                 visible: root.trackInfoOpen && !root.trackInfoLoading
                   && root.trackInfoRows.length > 0
                 width: parent.width
-                height: visible ? Style.space(260) : 0
+                height: visible ? playerPage.paneHeight : 0
                 clip: true
                 model: root.trackInfoRows
                 boundsBehavior: Flickable.StopAtBounds
@@ -2455,6 +2488,11 @@ Panel {
                 width: parent.width; label: "Показывать кнопки управления"
                 checked: Boolean(root.preference("showControls", true)); foreground: root.foreground
                 onClicked: root.setPreference("showControls", !checked)
+              }
+              Toggle {
+                width: parent.width; label: "Показывать громкость"
+                checked: Boolean(root.preference("showVolume", true)); foreground: root.foreground
+                onClicked: root.setPreference("showVolume", !checked)
               }
               Toggle {
                 width: parent.width; label: "Показывать исполнителя"

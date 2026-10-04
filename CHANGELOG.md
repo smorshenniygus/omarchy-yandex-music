@@ -10,6 +10,7 @@ All notable changes to this project are documented here. The format follows [Kee
 
 - A volume control in the bar to the right of the track title: a mute icon plus a level track, adjusted with the mouse wheel in 5% steps
 - Session restore retries transient network errors after boot or resume and shows a reconnecting message; the panel's retry action uses a new `reconnect` command
+- A persistent Show volume setting toggles the existing bar volume control independently of popup volume and transport buttons; enabled by default
 
 ### Changed
 
@@ -24,6 +25,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - Concurrent state saves use unique temporary files and can no longer publish an older snapshot last
 - Service IPC reads are bounded by a one-second deadline and the 64 KiB limit; a stalled client no longer blocks the service
 - Status polling no longer overwrites the volume while it is being changed
+- Now Playing sizes its list, lyrics, and track-info panes to the available height after adding the volume row, removing the redundant outer scrollbar without clipping controls; very short viewports retain an accessible scrolling fallback
 
 ## [0.9.0] - 2026-10-04
 

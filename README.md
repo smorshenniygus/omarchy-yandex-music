@@ -52,7 +52,7 @@ A native Yandex Music mini-player for the [Omarchy](https://omarchy.org/) shell.
 
 The bar player can show previous, play/pause, and next controls, album artwork, artist, track title, progress, and a volume control to the right of the title. Scroll the mouse wheel over the volume area to adjust the level in 5% steps, click the speaker icon to mute, and click the artwork or track information to open the popup.
 
-Long artist/title text can be truncated or scrolled as one continuous line. The information width, controls, artwork, and progress line are configurable.
+Long artist/title text can be truncated or scrolled as one continuous line. The information width, controls, artwork, progress line, and bar volume control are configurable. Settings → Bar → Show volume hides the bar volume area independently of the popup slider; it is enabled by default.
 
 ### Now Playing
 
@@ -63,6 +63,7 @@ Long artist/title text can be truncated or scrolled as one continuous line. The 
 - Actions also provides Add current track to playlist, Track Radio, queue mode, and Settings
 - Click the cover to smoothly expand it across the popup while retaining track details, a seekable progress bar, and the same control hierarchy; the mode survives closing and reopening the popup, while another click or `Escape` returns to the regular view
 - Explicit List, Lyrics, and Track Info tabs replace the former cluster of ambiguous queue-header icons
+- The list, lyrics, and track-info areas fit the remaining popup height and scroll internally, keeping the player controls stationary; exceptionally short screens retain outer scrolling so controls stay reachable
 - In Lyrics, synced LRC lines highlight and scroll with playback and clicking a line seeks to it; plain lyrics are used as a fallback, while missing lyrics or loading errors never interrupt playback
 - Track Info shows available album, release date, genre, labels, track number, version, description, and recording credits
 - Select any queue item directly
@@ -108,7 +109,7 @@ Available options:
 - Resume playback after service restart
 - Restore queue, track position, and volume independently
 - Best available or traffic-saving audio quality
-- Show/hide bar controls, artist, title, artwork, and progress
+- Show/hide bar controls, volume, artist, title, artwork, and progress independently
 - Square, rounded, or circular artwork
 - Compact, normal, or wide track information
 - Truncated or smoothly scrolling long text

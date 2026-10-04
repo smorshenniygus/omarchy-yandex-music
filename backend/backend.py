@@ -54,6 +54,7 @@ DEFAULT_PREFERENCES = {
     "waveDiversity": "default",
     "waveLanguage": "any",
     "showControls": True,
+    "showVolume": True,
     "showArtist": True,
     "showTitle": True,
     "showCover": True,
@@ -795,7 +796,7 @@ class Player:
         except Exception:
             saved = {}
         bool_keys = ("autoResume", "restoreQueue", "restorePosition", "restoreVolume",
-                     "showControls", "showArtist", "showTitle", "showCover", "showProgress")
+                     "showControls", "showVolume", "showArtist", "showTitle", "showCover", "showProgress")
         for key in bool_keys: preferences[key] = bool(preferences.get(key, DEFAULT_PREFERENCES[key]))
         allowed = {
             "audioQuality": ("best", "economy"),
@@ -816,7 +817,7 @@ class Player:
     def set_preference(self, key: str, value: Any) -> None:
         if key not in DEFAULT_PREFERENCES: raise ValueError(f"Неизвестная настройка: {key}")
         bool_keys = ("autoResume", "restoreQueue", "restorePosition", "restoreVolume",
-                     "showControls", "showArtist", "showTitle", "showCover", "showProgress")
+                     "showControls", "showVolume", "showArtist", "showTitle", "showCover", "showProgress")
         allowed = {
             "audioQuality": ("best", "economy"),
             "playbackMode": ("order", "shuffle", "repeatQueue", "repeatTrack"),

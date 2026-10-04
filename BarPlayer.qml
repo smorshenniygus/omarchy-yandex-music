@@ -16,6 +16,7 @@ Item {
   property real wheelAccumulator: 0
   readonly property var preferences: logic && logic.snapshot.preferences ? logic.snapshot.preferences : ({})
   readonly property bool showControls: preferences.showControls === undefined ? true : Boolean(preferences.showControls)
+  readonly property bool showVolume: preferences.showVolume === undefined ? true : Boolean(preferences.showVolume)
   readonly property bool showArtist: preferences.showArtist === undefined ? true : Boolean(preferences.showArtist)
   readonly property bool showTitle: preferences.showTitle === undefined ? true : Boolean(preferences.showTitle)
   readonly property bool showCover: preferences.showCover === undefined ? true : Boolean(preferences.showCover)
@@ -255,6 +256,7 @@ Item {
 
     Item {
       id: volumeSlot
+      visible: root.showVolume
       width: volumeIcon.width + Style.space(64)
       height: root.implicitHeight
 
