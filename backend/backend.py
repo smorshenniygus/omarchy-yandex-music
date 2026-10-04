@@ -74,6 +74,12 @@ AUDIO_STREAM_ATTEMPTS = 3
 AUDIO_STREAM_TIMEOUT = 5
 AUDIO_STALL_TIMEOUT = 20
 RATE_LIMIT_MESSAGE = "Яндекс Музыка временно ограничила запросы. Подождите минуту и повторите."
+RESTORE_RETRY_DELAYS = (3, 5, 10, 20, 30, 60)
+RESTORE_RETRY_MESSAGE = "Нет соединения с Яндекс Музыкой при запуске. Повторяем подключение…"
+RESTORE_OFFLINE_MESSAGE = (
+    "Не удалось подключиться к Яндекс Музыке: нет соединения. "
+    "Проверьте интернет и нажмите «Повторить»."
+)
 PLAYBACK_REPORT_FROM = "desktop_win-home-playlist_of_the_day-playlist-default"
 RADIO_REPORT_FROM = "mobile-radio-user-default"
 TELEMETRY_QUEUE_SIZE = 100
@@ -393,6 +399,7 @@ class Player:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.save_lock = threading.Lock()
+        self.restore_lock = threading.Lock()
         self.api_lock = threading.Lock()
         self.client: Client | None = None
         self.queue: list[Any] = []
@@ -813,18 +820,64 @@ class Player:
         atomic_json(TOKEN_FILE, saved)
         return saved["access_token"]
 
+    @staticmethod
+    def _is_transient_restore_error(exc: Any) -> bool:
+        """Detect temporary network/DNS failures, typical right after boot or resume."""
+        markers = (
+            "temporary failure", "failed to resolve", "name resolution", "max retries exceeded",
+            "network is unreachable", "no route to host", "name or service not known",
+            "connection aborted", "connection reset", "connection refused", "timed out",
+        )
+        transient_types = (
+            "connectionerror", "connecttimeout", "readtimeout", "timeout", "timedouterror",
+            "nameresolutionerror", "newconnectionerror", "maxretryerror", "gaierror", "networkerror",
+        )
+        current: BaseException | None = exc
+        for _ in range(4):
+            if current is None: break
+            if (any(name in type(current).__name__.lower() for name in transient_types)
+                    or any(marker in str(current).lower() for marker in markers)):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
     def _restore(self) -> None:
         if not TOKEN_FILE.exists(): return
+        self._restore_session_with_retry()
+
+    def _restore_session_with_retry(self) -> None:
+        """Restore the saved session, retrying while the network is not up yet."""
+        if not self.restore_lock.acquire(blocking=False): return
         try:
-            saved = self._load_token()
-            expires = int(saved.get("expires_in") or 0)
-            token = saved["access_token"]
-            if expires and time.time() >= int(saved.get("saved_at") or 0) + expires - 86400:
-                token = self._refresh_token(saved)
-            self._connect(token)
-            self._restore_queue()
-        except Exception as exc:
-            self._set_error(f"Не удалось восстановить сессию: {exc}")
+            for attempt in range(len(RESTORE_RETRY_DELAYS) + 1):
+                try:
+                    saved = self._load_token()
+                    expires = int(saved.get("expires_in") or 0)
+                    token = saved["access_token"]
+                    if expires and time.time() >= int(saved.get("saved_at") or 0) + expires - 86400:
+                        token = self._refresh_token(saved)
+                    self._connect(token)
+                    self._restore_queue()
+                    return
+                except Exception as exc:
+                    transient = self._is_transient_restore_error(exc)
+                    if not transient or attempt >= len(RESTORE_RETRY_DELAYS):
+                        self._set_error(RESTORE_OFFLINE_MESSAGE if transient
+                                        else f"Не удалось восстановить сессию: {self._friendly_error(exc)}")
+                        return
+                    with self.lock: self.state.update(connecting=True, error=RESTORE_RETRY_MESSAGE)
+                    threading.Event().wait(RESTORE_RETRY_DELAYS[attempt])
+        finally:
+            self.restore_lock.release()
+
+    def reconnect(self) -> None:
+        """Manual restore retry, used by the panel's «Повторить» button."""
+        with self.lock:
+            if (self.state.get("authenticated") and self.client is not None) or self.state.get("authPending"):
+                return
+            if not TOKEN_FILE.exists(): return
+            self.state.update(connecting=True, error="")
+        threading.Thread(target=self._restore_session_with_retry, daemon=True).start()
 
     def _connect(self, token: str) -> None:
         with self.lock: self.state.update(connecting=True, error="")
@@ -4372,6 +4425,7 @@ class Player:
         if cmd == "track_info": return self.track_info()
         if cmd == "track_info_refresh": return self.track_info(force=True)
         if cmd == "auth": self.authenticate()
+        elif cmd == "reconnect": self.reconnect()
         elif cmd == "logout": self.logout()
         elif cmd == "likes": self.play_likes()
         elif cmd == "wave": self.play_wave()
