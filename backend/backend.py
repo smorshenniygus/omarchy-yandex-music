@@ -14,6 +14,7 @@ import re
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -99,6 +100,8 @@ MPV_RESPONSE_MAX_BYTES = 1024 * 1024
 HTTP_JSON_MAX_BYTES = 1024 * 1024
 NOTIFICATION_COVER_MAX_BYTES = 5_000_000
 NETWORK_CHUNK_BYTES = 64 * 1024
+IPC_READ_TIMEOUT = 1.0
+IPC_WRITE_TIMEOUT = 3.0
 
 
 def recv_line(sock: socket.socket, max_bytes: int, source: str) -> bytes:
@@ -142,11 +145,22 @@ def read_http_json(response: Any, max_bytes: int, source: str) -> Any:
 
 
 def atomic_json(path: Path, value: Any) -> None:
+    # A unique temporary file per write: concurrent saves must not truncate or
+    # publish each other's half-written file.
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False))
-    tmp.chmod(0o600)
-    tmp.replace(path)
+    tmp: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as output:
+            tmp = Path(output.name)
+            json.dump(value, output, ensure_ascii=False)
+        tmp.chmod(0o600)
+        tmp.replace(path)
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 class MprisRoot(ServiceInterface):
@@ -378,6 +392,7 @@ def playback_control(function: Callable) -> Callable:
 class Player:
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        self.save_lock = threading.Lock()
         self.api_lock = threading.Lock()
         self.client: Client | None = None
         self.queue: list[Any] = []
@@ -1066,21 +1081,23 @@ class Player:
             self.collection_cache.pop("likes", None)
 
     def _save_state(self, force: bool = False) -> None:
-        if not force and time.monotonic() - self.last_saved_at < 5: return
-        with self.lock:
-            current = self._current_track_locked()
-            current_batch = self.radio_track_batches.get(
-                self._track_id(current), self.radio_batch_id) if current is not None else self.radio_batch_id
-            value = {"queue": [self._track_id(t) for t in self.queue if self._track_id(t)],
-                     "index": self.index, "queueName": self.state["queueName"],
-                     "position": self.state["position"], "playing": self.state["playing"],
-                     "volume": self.volume, "muted": self.muted,
-                     "radioStation": self.radio_station, "radioBatchId": current_batch}
-            value["queueCollectionKey"] = self.queue_collection_key
-            value["queueArtistId"] = self.queue_artist_id
-            value["queueArtistPage"] = self.queue_artist_page
-            value["queueArtistHasMore"] = self.queue_artist_has_more
-        atomic_json(STATE_FILE, value); self.last_saved_at = time.monotonic()
+        # Snapshot and write under one lock so an older snapshot can never land last.
+        with self.save_lock:
+            if not force and time.monotonic() - self.last_saved_at < 5: return
+            with self.lock:
+                current = self._current_track_locked()
+                current_batch = self.radio_track_batches.get(
+                    self._track_id(current), self.radio_batch_id) if current is not None else self.radio_batch_id
+                value = {"queue": [self._track_id(t) for t in self.queue if self._track_id(t)],
+                         "index": self.index, "queueName": self.state["queueName"],
+                         "position": self.state["position"], "playing": self.state["playing"],
+                         "volume": self.volume, "muted": self.muted,
+                         "radioStation": self.radio_station, "radioBatchId": current_batch}
+                value["queueCollectionKey"] = self.queue_collection_key
+                value["queueArtistId"] = self.queue_artist_id
+                value["queueArtistPage"] = self.queue_artist_page
+                value["queueArtistHasMore"] = self.queue_artist_has_more
+            atomic_json(STATE_FILE, value); self.last_saved_at = time.monotonic()
 
     def _restore_queue(self) -> None:
         if not STATE_FILE.exists() or not self.client: return
@@ -4431,6 +4448,47 @@ class Player:
         return {"ok": True}
 
 
+def _read_ipc_request(conn: socket.socket) -> dict[str, Any]:
+    """Read one request line within a deadline so a stalled client cannot block the service."""
+    raw = b""
+    deadline = time.monotonic() + IPC_READ_TIMEOUT
+    while b"\n" not in raw:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Превышено время ожидания IPC-запроса")
+        conn.settimeout(remaining)
+        chunk = conn.recv(min(NETWORK_CHUNK_BYTES, IPC_REQUEST_MAX_BYTES + 1 - len(raw)))
+        if not chunk:
+            raise ValueError("Неполный IPC-запрос")
+        raw += chunk
+        if len(raw) > IPC_REQUEST_MAX_BYTES:
+            raise ValueError("Слишком длинный IPC-запрос")
+    request = json.loads(raw.split(b"\n", 1)[0])
+    if not isinstance(request, dict):
+        raise ValueError("Некорректный IPC-запрос")
+    return request
+
+
+def _send_ipc_response(conn: socket.socket, response: dict[str, Any]) -> None:
+    try:
+        conn.settimeout(IPC_WRITE_TIMEOUT)
+        conn.sendall((json.dumps(response, ensure_ascii=False) + "\n").encode())
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _serve_connection(conn: socket.socket,
+                      handle: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
+    with conn:
+        try:
+            response = handle(_read_ipc_request(conn))
+        except TimeoutError:
+            response = {"error": "Превышено время ожидания IPC-запроса"}
+        except Exception as exc:
+            response = {"error": str(exc)}
+        _send_ipc_response(conn, response)
+
+
 def serve() -> None:
     SOCKET.unlink(missing_ok=True)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); server.bind(str(SOCKET)); os.chmod(SOCKET, 0o600)
@@ -4440,11 +4498,6 @@ def serve() -> None:
     signal.signal(signal.SIGTERM, shutdown); signal.signal(signal.SIGINT, shutdown)
     while True:
         conn, _ = server.accept()
-        with conn:
-            try:
-                raw = recv_line(conn, IPC_REQUEST_MAX_BYTES, "service IPC")
-                response = player.handle(json.loads(raw or b"{}"))
-            except Exception as exc: response = {"error": str(exc)}
-            conn.sendall((json.dumps(response, ensure_ascii=False) + "\n").encode())
+        _serve_connection(conn, player.handle)
 
 if __name__ == "__main__": serve()
